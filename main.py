@@ -2,8 +2,7 @@ import cv2 as cv
 import sys
 import matplotlib.pyplot as plt
 import numpy as np
-from typing import List
-
+from typing import List, Tuple
 
 # -------------------- FFT Utils -------------------- #
 def get_fft(gray: np.ndarray):
@@ -11,13 +10,11 @@ def get_fft(gray: np.ndarray):
     f = np.fft.fft2(gray)
     f_shift = np.fft.fftshift(f)
 
-    # Magnitude and phase
     magnitude = np.abs(f_shift)
     magnitude_log = np.log1p(magnitude)  # for visualization
     phase = np.angle(f_shift)
 
     return f_shift, magnitude, phase, magnitude_log
-
 
 
 def get_peaking_frequencies(mag: np.ndarray, num_peaks: int = 12, exclude_center: int = 8) -> list[tuple[int, int]]:
@@ -38,7 +35,6 @@ def get_peaking_frequencies(mag: np.ndarray, num_peaks: int = 12, exclude_center
         u = x - ccol
         v = y - crow
         relative_coords.append((u, v))
-        print(f"u: {u}, v: {v}")
 
     return relative_coords
 
@@ -74,18 +70,15 @@ def generate_filter(gray: np.ndarray, sigma: float, peaking_freqs: List[tuple[in
         
     return mask
 
-def plot_peaks(mag: np.ndarray, peaking_freqs: list[tuple[int, int]], radius: int = 5) -> np.ndarray:
-    """Overlay red circles on log-magnitude spectrum to visualize detected peaks."""
-    mag_disp = np.log1p(mag)
-    mag_disp = cv.normalize(mag_disp, None, 0, 255, cv.NORM_MINMAX).astype(np.uint8)
+def plot_peaks(mag: np.ndarray, peaking_freqs: List[Tuple[int,int]], radius: int = 5) -> np.ndarray:
+    """Overlay red circles on magnitude spectrum to visualize detected peaks."""
+    mag_disp = cv.normalize(np.log1p(mag), None, 0, 255, cv.NORM_MINMAX).astype(np.uint8)
     mag_disp = cv.merge([mag_disp]*3)
 
     h, w = mag.shape
     crow, ccol = h // 2, w // 2
     
-    # Include symmetric pairs and DC component for plotting circles
-    coords = set(peaking_freqs + [(-u, -v) for (u, v) in peaking_freqs] + [(0, 0)])
-
+    coords = set(peaking_freqs + [(-u, -v) for (u, v) in peaking_freqs])
     for (u, v) in coords:
         x, y = int(ccol + u), int(crow + v)
         cv.circle(mag_disp, (x, y), radius, (0, 0, 255), 1)
@@ -93,49 +86,66 @@ def plot_peaks(mag: np.ndarray, peaking_freqs: list[tuple[int, int]], radius: in
     return mag_disp
 
 
-def reconstruct_pattern(gray: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    """Reconstruct directly using Inverse FFT with the mask applied."""
-    f = np.fft.fft2(gray)
-    fshift = np.fft.fftshift(f)
-    
-    # Apply the mask: keep only the selected frequencies
-    f_filtered = fshift * (mask / 255)
-
+def reconstruct_pattern(fft: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Reconstruct image using inverse FFT with mask applied."""
+    f_filtered = fft * mask  # mask already 0–1
     ishift = np.fft.ifftshift(f_filtered)
     img_back = np.fft.ifft2(ishift)
     return np.abs(img_back)
 
-def apply_uniform_lighting(gray: np.ndarray, blur_kernel: int = 101) -> np.ndarray:
-    """Divides the image by its heavily blurred version to remove illumination."""
-    # Large kernel for strong blur, adjust for your image scale
-    blurred = cv.GaussianBlur(gray, (blur_kernel, blur_kernel), 0)
-    normalized = gray.astype(np.float32) / (blurred.astype(np.float32) + 1e-8)  # Avoid division by zero
-    normalized = cv.normalize(normalized, None, 0, 255, cv.NORM_MINMAX).astype(np.uint8)
-    return normalized
+
+def apply_uniform_lighting(original: np.ndarray, pattern: np.ndarray) -> np.ndarray:
+    """Remove periodic pattern to produce uniform lighting."""
+    uniform = original / (pattern + 1e-5)  # avoid divide by zero
+    uniform = cv.normalize(uniform, None, 0, 255, cv.NORM_MINMAX).astype(np.uint8)
+    return uniform
 
 
 # -------------------- Visualization -------------------- #
-def show_image(working_img: np.ndarray, mag: np.ndarray, mag_peaks: np.ndarray) -> None:
-    """Display 3 panels for analysis."""
-    fig, axs = plt.subplots(1, 3, figsize=(20, 5))
+def show_full_analysis(gray, gray_uniform, pattern, mag_log, mag_peaks, filter_mask, title_prefix=""):
+    """Display 2x3 grid for image + frequency analysis."""
+    fig, axs = plt.subplots(2, 3, figsize=(15, 10))
 
-    axs[0].imshow(working_img, cmap='gray')
-    axs[0].set_title(f"Working")
-    axs[0].axis("off")
+    # Top row
+    axs[0, 0].imshow(gray, cmap='gray')
+    axs[0, 0].set_title(f"{title_prefix}Gray Image")
+    axs[0, 0].axis("off")
 
-    axs[1].imshow(mag, cmap='magma')
-    axs[1].set_title(f"(Magnitude Spectrum (Log))")
-    axs[1].axis("off")
+    axs[0, 1].imshow(gray_uniform, cmap='gray')
+    axs[0, 1].set_title(f"{title_prefix}Uniform Lighting")
+    axs[0, 1].axis("off")
 
-    axs[2].imshow(mag_peaks, cmap="magma")
-    axs[2].set_title(f"(Detected Frequency Peaks)")
-    axs[2].axis("off")
+    axs[0, 2].imshow(pattern, cmap='gray')
+    axs[0, 2].set_title("Extracted Pattern")
+    axs[0, 2].axis("off")
 
+    # Bottom row
+    axs[1, 0].imshow(mag_log, cmap='magma')
+    axs[1, 0].set_title("Magnitude Spectrum (Log)")
+    axs[1, 0].axis("off")
+
+    # Only use cmap if image is single-channel
+    if mag_peaks.ndim == 2 or (mag_peaks.ndim == 3 and mag_peaks.shape[2] == 1):
+        axs[1, 1].imshow(mag_peaks, cmap='magma')
+    else:
+        axs[1, 1].imshow(mag_peaks)
+    axs[1, 1].set_title("Magnitude + Peaking Freqs")
+    axs[1, 1].axis("off")
+
+    # For filter_mask, handle channel case
+    if filter_mask.ndim == 2 or (filter_mask.ndim == 3 and filter_mask.shape[2] == 1):
+        axs[1, 2].imshow(filter_mask, cmap='jet')
+    else:
+        axs[1, 2].imshow(filter_mask[:, :, 0], cmap='jet')
+    axs[1, 2].set_title("Pattern Extraction Filter")
+    axs[1, 2].axis("off")
 
     plt.tight_layout()
     plt.show()
-# -------------------- Main -------------------- #
 
+
+
+# -------------------- Main -------------------- #
 def main():
     if len(sys.argv) < 2:
         print("Usage: python script.py <image_file>")
@@ -148,7 +158,6 @@ def main():
     fft, mag, _, mag_log = get_fft(gray_img)
     peak_freqs = get_peaking_frequencies(mag)
     mag_peaks_vis = plot_peaks(mag, peak_freqs)
-    show_image(gray_img, mag_log, mag_peaks_vis, title_prefix="Original")
 
     # --- 2. Pattern Extraction ---
     mask = generate_filter(gray=gray_img, peaking_freqs=peak_freqs, sigma=1.0)
@@ -156,10 +165,13 @@ def main():
     _, p_mag, _, p_mag_log = get_fft(reconstructed)
     p_peaks = get_peaking_frequencies(p_mag)
     p_vis = plot_peaks(p_mag, p_peaks)
-    show_image(reconstructed, p_mag_log, p_vis, title_prefix="Extracted Pattern")
 
+
+    # --- 3. Uniform Lighting ---
+    uniform_img = apply_uniform_lighting(gray_img, reconstructed)
     
-    
+    show_full_analysis(gray=gray_img, gray_uniform=uniform_img, pattern=reconstructed, mag_log=mag_log, mag_peaks=mag_peaks_vis, filter_mask=mask, title_prefix="Project3 Image")
+
     
 
 
